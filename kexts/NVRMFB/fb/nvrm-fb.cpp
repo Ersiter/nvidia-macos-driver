@@ -1786,6 +1786,17 @@ bool NVRMNVDAFramebuffer::reflip()
     IOFree(cfg, sizeof *cfg); IOFree(rep, sizeof *rep);
     return ok ? true : false;
 }
+// A table whose every entry is zero would black the panel for as long as it stays applied. macOS sends one when a
+// display is added again and does not follow it with the normal table, so the picture never returns.
+static bool nvrmLutIsBlack(UInt32 channels, UInt32 count, UInt32 width, const void *data)
+{
+    for (unsigned c = 0; c < (channels == 3 ? 3u : 1u); c++)
+        for (UInt32 i = 0; i < count; i++) {
+            const UInt32 v = width <= 8 ? ((const UInt8 *)data)[c * count + i] : ((const UInt16 *)data)[c * count + i];
+            if (v) return false;
+        }
+    return true;
+}
 // setGammaTable: WindowServer's CLUT (1 or 3 channels, planar, `count` entries of `width` bits; 8-bit entries are bytes,
 // wider ones 16-bit words, as IOGraphics passes them) resampled to NVKMS's 1024-entry 16-bit ramps and committed as the
 // head's output LUT on its own: no mode change and no flip wait, so Night Shift's gradual changes cannot blank or stall
@@ -1797,6 +1808,10 @@ IOReturn NVRMNVDAFramebuffer::nvrmSetGamma(UInt32 channels, UInt32 count, UInt32
     if (!data || (channels != 1 && channels != 3) || count < 2 || count > 4096 || width < 1 || width > 16) {
         FBLOG("gamma: refused a table (%u channels, %u entries, %u bits)", channels, count, width);
         return kIOReturnBadArgument;
+    }
+    if (nvrmLutIsBlack(channels, count, width, data)) {
+        FBLOG("gamma: all-black table ignored (previous LUT kept)");
+        return kIOReturnSuccess;
     }
     if (!fGamma) {
         fGamma = (struct NvKmsLutRamps *)IOMalloc(sizeof *fGamma);
