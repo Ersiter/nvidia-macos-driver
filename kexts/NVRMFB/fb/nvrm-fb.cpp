@@ -324,6 +324,8 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // A different monitor was plugged into this framebuffer's connector (its EDID changed): see adoptSwappedDisplay.
     bool fEdidSwapped = false;
     void adoptSwappedDisplay();
+    void clearDisplayAudioProperties();
+    void publishDisplayAudioProperties();
     static void connectNotifyFire(thread_call_param_t p0, thread_call_param_t);
     volatile SInt32 fStopping = 0;
     void scheduleCall(thread_call_t call, uint64_t deadline);
@@ -484,8 +486,22 @@ public:
 OSDefineMetaClassAndStructors(NVRMNVDAFramebuffer, IOFramebuffer)
 struct nvrm_dpy_rec {
     NvKmsKapiDisplay handle; NvKmsKapiConnector connector; NvU32 headMask; NvBool internal;
-    NvU32 edidSize; NvU8 edid[NVKMS_KAPI_EDID_BUFFER_SIZE];
+    NvU32 hdaConnectorType; NvU32 edidSize; NvU8 edid[NVKMS_KAPI_EDID_BUFFER_SIZE];
 };
+static NvU32 nvrmHdaConnectorType(const struct NvKmsKapiConnectorInfo *info)
+{
+    if (info->signalFormat == NVKMS_CONNECTOR_SIGNAL_FORMAT_DP) return 0x400;
+    if (info->signalFormat == NVKMS_CONNECTOR_SIGNAL_FORMAT_TMDS && info->type == NVKMS_CONNECTOR_TYPE_HDMI)
+        return 0x800;
+    return 0;
+}
+static NvU32 nvrmQueryHdaConnectorType(struct NvKmsKapiFunctionsTable *kms, struct NvKmsKapiDevice *device,
+                                       NvKmsKapiConnector connector)
+{
+    if (!kms || !kms->getConnectorInfo) return 0;
+    struct NvKmsKapiConnectorInfo info = {};
+    return kms->getConnectorInfo(device, connector, &info) ? nvrmHdaConnectorType(&info) : 0;
+}
 static struct NvKmsKapiDevice *gDev;
 static struct nvrm_dpy_rec gDpy[NVKMS_KAPI_MAX_CONNECTORS * 2];
 static int gNDpy = -1;
@@ -765,6 +781,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
             if (gNDpy >= (int)(sizeof gDpy / sizeof gDpy[0])) { FBLOG("dpy table full at %d", gNDpy); break; }
             struct nvrm_dpy_rec *r = &gDpy[gNDpy++];
             r->handle = handles[i]; r->connector = si.connectorHandle; r->headMask = si.headMask; r->internal = si.internal;
+            r->hdaConnectorType = si.internal ? 0 : nvrmQueryHdaConnectorType(fKms, fDev, si.connectorHandle);
             r->edidSize = dd->edid.bufferSize > sizeof r->edid ? (NvU32)sizeof r->edid : dd->edid.bufferSize;
             nvu_copy(r->edid, dd->edid.buffer, r->edidSize);
         }
@@ -844,23 +861,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
         nvrmEdidPanelSizeMm(fEdid, fEdidSize, &fEdidMmW, &fEdidMmH);
         FBLOG("fb%u: EDID %u B, panel %ux%u mm (imageWidth/imageHeight)", fIndex, (unsigned)fEdidSize,
               (unsigned)fEdidMmW, (unsigned)fEdidMmH);
-        // HDMI/DisplayPort audio: build the sink's ELD from its EDID and publish it with the hda-gfx pairing, the same
-        // two properties AMD and Intel framebuffers expose, so the card's audio function (NMHDA + AppleHDAController)
-        // has the Short Audio Descriptors a codec needs. External connectors only -- an internal eDP panel has no
-        // audio. The connector-type guess is HDMI (the common case and what the reports describe); an HDMI VSDB in the
-        // EDID confirms it, and NVKMS must still enable the audio stream on the head for a codec to actually appear.
-        if (!fInternal && fEdidSize >= 128) {
-            uint8_t eld[NVRM_ELD_MAX];
-            size_t eldn = nvrm_build_eld(fEdid, fEdidSize, NVRM_ELD_CONN_HDMI, eld);
-            if (eldn) {
-                if (OSData *d = OSData::withBytes(eld, (unsigned)eldn)) { setProperty("nvda-eld", d); d->release(); }
-                setProperty("hda-gfx", "onboard-1");
-                FBLOG("fb%u: published %lu-byte ELD and hda-gfx=onboard-1 for display audio",
-                      fIndex, (unsigned long)eldn);
-            } else
-                FBLOG("fb%u: EDID %u B yielded no ELD; no display-audio properties published",
-                      fIndex, (unsigned)fEdidSize);
-        }
+        publishDisplayAudioProperties();
         NvU32 avail = r->headMask & ~gHeadsTaken;
         if (gBootHead >= 0) {
             if (fDisplay == gBootDpy && (avail & (1u << gBootHead))) avail = 1u << gBootHead;
@@ -1204,6 +1205,83 @@ void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_
 // is kept: it backs the surface WindowServer is drawing into, and it cannot be replaced under it. A new monitor whose
 // largest raster needs more than that allocation is offered what fits (the mode check refuses the rest as larger than
 // the scanout allocation) and gets its full size at the next start; the log says so.
+// The five AppleHDA association properties extend the approach in PR #284 by Hi-Jiajun.
+static OSObject *copyGpuHdaGfx(IOService *provider)
+{
+    IORegistryEntry *entry = provider;
+    while (entry) {
+        if (entry->metaCast("IOPCIDevice")) {
+            OSObject *value = entry->copyProperty("hda-gfx");
+            if (!OSDynamicCast(OSData, value) && !OSDynamicCast(OSString, value)) OSSafeReleaseNULL(value);
+            return value;
+        }
+        entry = entry->getParentEntry(gIOServicePlane);
+    }
+    return nullptr;
+}
+
+void NVRMNVDAFramebuffer::clearDisplayAudioProperties()
+{
+    removeProperty("nvda-eld");
+    removeProperty("hda-gfx");
+    removeProperty("connector-type");
+    removeProperty("port-number");
+    removeProperty("av-signal-type");
+    removeProperty("audio-codec-info");
+    removeProperty("IODisplayEDID");
+}
+
+void NVRMNVDAFramebuffer::publishDisplayAudioProperties()
+{
+    clearDisplayAudioProperties();
+    if (fInternal || fEdidSize < 128 || fIndex >= (unsigned)gNDpy) return;
+
+    const NvU32 connectorType = gDpy[fIndex].hdaConnectorType;
+    const int eldConnector = connectorType == 0x800 ? NVRM_ELD_CONN_HDMI : NVRM_ELD_CONN_DP;
+    uint8_t eld[NVRM_ELD_MAX];
+    size_t eldn = nvrm_build_eld(fEdid, fEdidSize, eldConnector, eld);
+    if (!eldn) return;
+    if (OSData *data = OSData::withBytes(eld, (unsigned)eldn)) {
+        setProperty("nvda-eld", data);
+        data->release();
+    }
+
+    OSObject *pairing = copyGpuHdaGfx(getProvider());
+    const bool hasPairing = pairing != nullptr;
+    if (pairing) { setProperty("hda-gfx", pairing); pairing->release(); }
+    else setProperty("hda-gfx", "onboard-1");
+
+    OSObject *codecInfoObject = copyProperty("NVRMFBDisplayAudioCodecInfo");
+    OSData *codecInfo = OSDynamicCast(OSData, codecInfoObject);
+    const NvU8 *bytes = codecInfo ? (const NvU8 *)codecInfo->getBytesNoCopy() : nullptr;
+    if (!bytes || codecInfo->getLength() != 4 || !bytes[1] || !bytes[2]) {
+        OSSafeReleaseNULL(codecInfoObject);
+        return;
+    }
+
+    struct nvrm_cea_scan cea;
+    nvrm_scan_cea(fEdid, fEdidSize, &cea);
+    if (!cea.has_audio || !connectorType || !hasPairing) {
+        OSSafeReleaseNULL(codecInfoObject);
+        return;
+    }
+
+    NvU8 connector[4] = { (NvU8)connectorType, (NvU8)(connectorType >> 8),
+                          (NvU8)(connectorType >> 16), (NvU8)(connectorType >> 24) };
+    NvU8 port[4] = { 0, 0, 0, 0 };
+    NvU8 signal[4] = { 8, 0, 0, 0 };
+    bool published = setProperty("connector-type", connector, sizeof connector);
+    if (published) published = setProperty("port-number", port, sizeof port);
+    if (published) published = setProperty("av-signal-type", signal, sizeof signal);
+    if (published) published = setProperty("audio-codec-info", codecInfo);
+    if (published) published = setProperty("IODisplayEDID", fEdid, fEdidSize);
+    OSSafeReleaseNULL(codecInfoObject);
+    if (!published) {
+        clearDisplayAudioProperties();
+        FBLOG("fb%u: failed to publish display-audio association", fIndex);
+    }
+}
+
 void NVRMNVDAFramebuffer::adoptSwappedDisplay()
 {
     if (fIndex >= (unsigned)gNDpy) return;
@@ -1211,12 +1289,7 @@ void NVRMNVDAFramebuffer::adoptSwappedDisplay()
     fEdidSize = (NvU16)(r->edidSize > sizeof fEdid ? sizeof fEdid : r->edidSize);
     nvu_copy(fEdid, r->edid, fEdidSize);
     nvrmEdidPanelSizeMm(fEdid, fEdidSize, &fEdidMmW, &fEdidMmH);
-    if (!fInternal && fEdidSize >= 128) {
-        uint8_t eld[NVRM_ELD_MAX];
-        size_t eldn = nvrm_build_eld(fEdid, fEdidSize, NVRM_ELD_CONN_HDMI, eld);
-        if (eldn) { if (OSData *d = OSData::withBytes(eld, (unsigned)eldn)) { setProperty("nvda-eld", d); d->release(); } }
-        else removeProperty("nvda-eld");
-    }
+    publishDisplayAudioProperties();
     const NvU64 keepAlloc = fAllocSize;
     const NvU32 oldW = fScalerMaxW, oldH = fScalerMaxH;
     computeScanoutCaps(fPitchAlign);
@@ -1261,6 +1334,13 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             // that was seen disconnected and is connected again gets its head lit with the same full mode set the
             // display-wake path uses (reflip). Only on that transition, so other display events cause no modeset.
             if (!dynOk) continue;
+            bool audioTypeChanged = false;
+            if (dd->connected && kdpy >= 0) {
+                NvU32 connectorType = gDpy[kdpy].internal ? 0 :
+                    nvrmQueryHdaConnectorType(me->fKms, me->fDev, gDpy[kdpy].connector);
+                audioTypeChanged = connectorType != gDpy[kdpy].hdaConnectorType;
+                gDpy[kdpy].hdaConnectorType = connectorType;
+            }
             // NVKMS names a display by its connector, so a DIFFERENT monitor plugged into the same port comes back as
             // the same handle. Its EDID is what tells them apart: the old EDID stayed published, and macOS kept the
             // previous monitor's name, size and modes (a new monitor still listed as the one it replaced).
@@ -1277,10 +1357,13 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
                 NVRMNVDAFramebuffer *fb = gFBs[f];
                 if (!fb || fb->fDisplay != handles[i]) continue;
-                if (!dd->connected) { if (!fb->fDpyLost) FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex); fb->fDpyLost = true; }
-                else if ((fb->fDpyLost || swapped) && nrelight < sizeof relight / sizeof relight[0]) {
+                if (!dd->connected) {
+                    if (!fb->fDpyLost) FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex);
+                    fb->fDpyLost = true;
+                    fb->clearDisplayAudioProperties();
+                } else if ((fb->fDpyLost || swapped) && nrelight < sizeof relight / sizeof relight[0]) {
                     fb->fDpyLost = false; if (swapped) fb->fEdidSwapped = true; fb->retain(); relight[nrelight++] = fb;
-                }
+                } else if (audioTypeChanged) fb->publishDisplayAudioProperties();
             }
             continue;
         }
@@ -1289,7 +1372,8 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         if (!me->fKms->getStaticDisplayInfo(me->fDev, handles[i], &si)) continue;
         if (gNDpy >= (int)(sizeof gDpy / sizeof gDpy[0])) break;
         struct nvrm_dpy_rec *r = &gDpy[gNDpy];
-        r->handle = handles[i]; r->connector = si.connectorHandle; r->headMask = si.headMask;
+        r->handle = handles[i]; r->connector = si.connectorHandle; r->headMask = si.headMask; r->internal = si.internal;
+        r->hdaConnectorType = si.internal ? 0 : nvrmQueryHdaConnectorType(me->fKms, me->fDev, si.connectorHandle);
         r->edidSize = dd->edid.bufferSize > sizeof r->edid ? (NvU32)sizeof r->edid : dd->edid.bufferSize;
         nvu_copy(r->edid, dd->edid.buffer, r->edidSize);
         FBLOG("hot-plug: display 0x%x connector 0x%x headMask 0x%x connected after boot -> index %d",
@@ -1311,7 +1395,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             if (!gConnectNotify) gConnectNotify = nvrmfbCall(connectNotifyFire, nullptr);
             uint64_t d; clock_interval_to_deadline(500, kMillisecondScale, &d);
             if (gConnectNotify) thread_call_enter1_delayed(gConnectNotify, fb, d);
-        }
+        } else if (!OSAddAtomic(0, &fb->fStopping)) fb->publishDisplayAudioProperties();
         fb->release();
     }
     if (!added) return;
