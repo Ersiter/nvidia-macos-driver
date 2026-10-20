@@ -398,6 +398,10 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     volatile SInt32 fWillSleepOff = 0;
     static IOReturn sleepTap(OSObject *self, void *, IOFramebuffer *, IOIndex event, void *info);
     bool fDpyLost = false;   // the connector is disconnected; re-sense after its EDID is restored
+    // macOS pushes an all-black output LUT right after a display comes back; only that window is ignored so a
+    // deliberate fade or blackout still applies.
+    UInt64 fBlackLutDeadline = 0;
+    bool fRelightAudioValid = false;   // the reconnect carried a readable EDID, so cached audio may be republished
     static void eventCallback(const struct NvKmsKapiEvent *event) {
         // only display changes are logged: the routine events arrive every minute for as long as the Mac is up, and
         // in sent logs they pushed every boot line past the collector's 512 KB limit
@@ -1378,6 +1382,9 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                         nvu_copy(fb->fEdid, r->edid, fb->fEdidSize);
                         nvrmEdidPanelSizeMm(fb->fEdid, fb->fEdidSize, &fb->fEdidMmW, &fb->fEdidMmH);
                         fb->fDpyLost = false;
+                        fb->fRelightAudioValid = dd->edid.bufferSize >= 128;
+                        fb->fBlackLutDeadline = 0;
+                        clock_interval_to_deadline(15000, kMillisecondScale, &fb->fBlackLutDeadline);
                     }
                     if (swapped) fb->fEdidSwapped = true;
                     if (nrelight < sizeof relight / sizeof relight[0]) {
@@ -1432,7 +1439,12 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
             const bool swapped = fb->fEdidSwapped;
             fb->fEdidSwapped = false;
             if (swapped) fb->adoptSwappedDisplay();
-            else fb->publishDisplayAudioProperties();
+            else if (fb->fRelightAudioValid) fb->publishDisplayAudioProperties();
+            else {
+                fb->clearDisplayAudioProperties();
+                FBLOG("fb%u: reconnect has no readable EDID -- display-audio properties stay cleared", fb->fIndex);
+            }
+            fb->fRelightAudioValid = false;
             fb->notifyConnectionChanged(500);
         }
         fb->release();
@@ -1809,10 +1821,12 @@ IOReturn NVRMNVDAFramebuffer::nvrmSetGamma(UInt32 channels, UInt32 count, UInt32
         FBLOG("gamma: refused a table (%u channels, %u entries, %u bits)", channels, count, width);
         return kIOReturnBadArgument;
     }
-    if (nvrmLutIsBlack(channels, count, width, data)) {
-        FBLOG("gamma: all-black table ignored (previous LUT kept)");
+    if (nvrmLutIsBlack(channels, count, width, data) && fBlackLutDeadline &&
+        mach_absolute_time() < fBlackLutDeadline) {
+        FBLOG("gamma: all-black table ignored after a reconnect (previous LUT kept)");
         return kIOReturnSuccess;
     }
+    fBlackLutDeadline = 0;
     if (!fGamma) {
         fGamma = (struct NvKmsLutRamps *)IOMalloc(sizeof *fGamma);
         if (!fGamma) return kIOReturnNoMemory;
