@@ -321,11 +321,12 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     // This instance exists because a display appeared after boot (see gNDpyBoot), and its connect handler has already
     // been fired once -- see connectNotifyFire and enableController.
     bool fHotplugBorn = false, fConnectFired = false;
-    // A different monitor was plugged into this framebuffer's connector (its EDID changed): see adoptSwappedDisplay.
     bool fEdidSwapped = false;
     void adoptSwappedDisplay();
     void clearDisplayAudioProperties();
     void publishDisplayAudioProperties();
+    thread_call_t fConnectNotify = nullptr;
+    void notifyConnectionChanged(unsigned delayMs);
     static void connectNotifyFire(thread_call_param_t p0, thread_call_param_t);
     volatile SInt32 fStopping = 0;
     void scheduleCall(thread_call_t call, uint64_t deadline);
@@ -396,7 +397,7 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     IONotifier *fSleepTap = nullptr;
     volatile SInt32 fWillSleepOff = 0;
     static IOReturn sleepTap(OSObject *self, void *, IOFramebuffer *, IOIndex event, void *info);
-    bool fDpyLost = false;   // hot-plug saw this framebuffer's display disconnected; light it again when it returns
+    bool fDpyLost = false;   // the connector is disconnected; re-sense after its EDID is restored
     static void eventCallback(const struct NvKmsKapiEvent *event) {
         // only display changes are logged: the routine events arrive every minute for as long as the Mac is up, and
         // in sent logs they pushed every boot line past the collector's 512 KB limit
@@ -477,7 +478,7 @@ public:
           return kIOReturnSuccess; }
     IOReturn setAttributeForConnection(IOIndex connectIndex, IOSelect attribute, uintptr_t value) override;
     IOItemCount getConnectionCount() override { return 1; }
-    bool hasDDCConnect(IOIndex) override { return fEdidSize >= 128; }
+    bool hasDDCConnect(IOIndex) override { return !fDpyLost && fEdidSize >= 128; }
     IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType, IOOptionBits options, UInt8 *data, IOByteCount *length) override;
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **interruptRef) override;
     IOReturn unregisterInterrupt(void *interruptRef) override { return kIOReturnSuccess; }
@@ -1184,17 +1185,21 @@ static NVRMNVDAFramebuffer *gFBs[16];
 // framebuffer; this does the same: the display is added to the table and the idle nubs are matched again, so the next
 // framebuffer starts exactly as it would have at boot with the monitor already on.
 static thread_call_t gHotplug = nullptr;
-// A framebuffer whose display appeared after boot has to tell the framework its connection is new, through the handler
-// the framework registered for kIOFBConnectInterruptType (fConnect). iOService::registerForInterruptType does keep that
-// handler, but nothing ever invoked it: CoreDisplay's connect-change path (IOFBInterestCallback ->
-// IOFBProcessConnectChange) then never runs, CoreGraphics keeps listing the displays it saw at startup, and the new
-// display gets no display pipe. The mode set has to be done first (WindowServer re-probes a framebuffer that has a
-// mode), so this is a delayed call.
-static thread_call_t gConnectNotify = nullptr;
+// Tell the framework to re-sense this connection after its state changes. The per-framebuffer call uses the registered
+// kIOFBConnectInterruptType handler; scheduleCall supplies its queued-work retain and stop-time cancellation.
+void NVRMNVDAFramebuffer::notifyConnectionChanged(unsigned delayMs)
+{
+    if (fConnectNotify) {
+        uint64_t deadline; clock_interval_to_deadline(delayMs, kMillisecondScale, &deadline);
+        scheduleCall(fConnectNotify, deadline);
+    }
+}
 void NVRMNVDAFramebuffer::connectNotifyFire(thread_call_param_t p0, thread_call_param_t)
 {
     NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
-    if (!me || OSAddAtomic(0, &me->fStopping)) return;
+    if (!me) return;
+    NVRMCallReference callReference(me);
+    if (OSAddAtomic(0, &me->fStopping)) return;
     if (!me->fConnect.proc) { FBLOG("fb%u connect notify: nothing registered yet", me->fIndex); return; }
     me->fConnectFired = true;
     FBLOG("fb%u -> connect interrupt (the framework's registered handler)", me->fIndex);
@@ -1314,13 +1319,14 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     NVRMNVDAFramebuffer *me = gFB;
     if (!me || !me->fKms || !me->fDev || gNDpy < 0) return;
     NvU32 n = 0; NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2];
-    if (!me->fKms->getDisplays(me->fDev, &n, NULL) || n == 0) return;
+    if (!me->fKms->getDisplays(me->fDev, &n, NULL)) return;
     if (n > sizeof handles / sizeof handles[0]) n = sizeof handles / sizeof handles[0];
-    if (!me->fKms->getDisplays(me->fDev, &n, handles)) return;
+    if (n && !me->fKms->getDisplays(me->fDev, &n, handles)) return;
     struct NvKmsKapiDynamicDisplayParams *dd = (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *dd);
     if (!dd) return;
     int added = 0;
     NVRMNVDAFramebuffer *relight[16]; unsigned nrelight = 0;
+    NVRMNVDAFramebuffer *notify[16]; unsigned nnotify = 0;
     IORecursiveLock *sl = startLock();
     if (sl) IORecursiveLockLock(sl);
     for (NvU32 i = 0; i < n; i++) {
@@ -1358,11 +1364,25 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                 NVRMNVDAFramebuffer *fb = gFBs[f];
                 if (!fb || fb->fDisplay != handles[i]) continue;
                 if (!dd->connected) {
-                    if (!fb->fDpyLost) FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex);
-                    fb->fDpyLost = true;
-                    fb->clearDisplayAudioProperties();
-                } else if ((fb->fDpyLost || swapped) && nrelight < sizeof relight / sizeof relight[0]) {
-                    fb->fDpyLost = false; if (swapped) fb->fEdidSwapped = true; fb->retain(); relight[nrelight++] = fb;
+                    if (!fb->fDpyLost) {
+                        FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex);
+                        fb->fDpyLost = true;
+                        fb->fEdidSize = 0;
+                        fb->clearDisplayAudioProperties();
+                        if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
+                    }
+                } else if (fb->fDpyLost || swapped) {
+                    if (fb->fDpyLost && kdpy >= 0) {
+                        const struct nvrm_dpy_rec *r = &gDpy[kdpy];
+                        fb->fEdidSize = (NvU16)(r->edidSize > sizeof fb->fEdid ? sizeof fb->fEdid : r->edidSize);
+                        nvu_copy(fb->fEdid, r->edid, fb->fEdidSize);
+                        nvrmEdidPanelSizeMm(fb->fEdid, fb->fEdidSize, &fb->fEdidMmW, &fb->fEdidMmH);
+                        fb->fDpyLost = false;
+                    }
+                    if (swapped) fb->fEdidSwapped = true;
+                    if (nrelight < sizeof relight / sizeof relight[0]) {
+                        fb->retain(); relight[nrelight++] = fb;
+                    }
                 } else if (audioTypeChanged) fb->publishDisplayAudioProperties();
             }
             continue;
@@ -1380,22 +1400,41 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
               handles[i], (unsigned)si.connectorHandle, (unsigned)si.headMask, gNDpy);
         gNDpy++; added++;
     }
+    for (int k = 0; k < gNDpy; k++) {
+        bool listed = false;
+        for (NvU32 i = 0; i < n; i++) if (gDpy[k].handle == handles[i]) { listed = true; break; }
+        if (listed) continue;
+        nvu_zero(dd, sizeof *dd); dd->handle = gDpy[k].handle;
+        if (!me->fKms->getDynamicDisplayInfo(me->fDev, dd) || dd->connected) continue;
+        for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
+            NVRMNVDAFramebuffer *fb = gFBs[f];
+            if (!fb || fb->fDisplay != gDpy[k].handle || fb->fDpyLost) continue;
+            FBLOG("hot-plug: known display 0x%x omitted from NVKMS list and confirmed disconnected (fb %u)",
+                  gDpy[k].handle, fb->fIndex);
+            fb->fDpyLost = true;
+            fb->fEdidSize = 0;
+            fb->clearDisplayAudioProperties();
+            if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
+        }
+    }
     if (sl) IORecursiveLockUnlock(sl);
     IOFree(dd, sizeof *dd);
+    for (unsigned f = 0; f < nnotify; f++) {
+        notify[f]->notifyConnectionChanged(500);
+        notify[f]->release();
+    }
     for (unsigned f = 0; f < nrelight; f++) {
         NVRMNVDAFramebuffer *fb = relight[f];
         bool ok = !OSAddAtomic(0, &fb->fStopping) && !fb->fHeadSlept && fb->reflip();
         FBLOG("hot-plug: display 0x%x is back (fb %u): head %u lit again -> ok %u rc %d",
               fb->fDisplay, fb->fIndex, fb->fHead, (unsigned)ok, fb->fReflipRc);
-        if (fb->fEdidSwapped && !OSAddAtomic(0, &fb->fStopping)) {
+        if (!OSAddAtomic(0, &fb->fStopping) && !fb->fDpyLost) {
+            const bool swapped = fb->fEdidSwapped;
             fb->fEdidSwapped = false;
-            fb->adoptSwappedDisplay();
-            // the framework's connect-change path re-reads the EDID (getDDCBlock), the modes and the display's name,
-            // as it does when a monitor is plugged into a real Mac; the head is lit first so it re-probes a live display
-            if (!gConnectNotify) gConnectNotify = nvrmfbCall(connectNotifyFire, nullptr);
-            uint64_t d; clock_interval_to_deadline(500, kMillisecondScale, &d);
-            if (gConnectNotify) thread_call_enter1_delayed(gConnectNotify, fb, d);
-        } else if (!OSAddAtomic(0, &fb->fStopping)) fb->publishDisplayAudioProperties();
+            if (swapped) fb->adoptSwappedDisplay();
+            else fb->publishDisplayAudioProperties();
+            fb->notifyConnectionChanged(500);
+        }
         fb->release();
     }
     if (!added) return;
@@ -2307,6 +2346,8 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     fKms = (struct NvKmsKapiFunctionsTable *)(uintptr_t)propU64(provider, "nvkms-kapi");
     fGpuId = (NvU32)propU64(provider, "gpu-id");
     fIndex = (unsigned)propU64(provider, "fb-index");
+    fConnectNotify = nvrmfbCall(connectNotifyFire, this);
+    if (!fConnectNotify) { FBLOG("fb%u: connect notification allocation failed -- refusing to start", fIndex); return false; }
     nvrmDiscoverBar1(provider, &fBarLen, &fBar1Base);
     FBLOG("BAR1 metadata: %llu MB at 0x%llx; normal surface budget %llu MB",
           (unsigned long long)(fBarLen >> 20), (unsigned long long)fBar1Base,
@@ -2339,7 +2380,6 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     // gDpy and re-registered the idle nub). Such an instance has to fire the framework's connect handler once its head
     // has a mode -- see connectNotifyFire and enableController.
     fHotplugBorn = (gNDpyBoot >= 0 && (int)fIndex >= gNDpyBoot);
-    if (fHotplugBorn && !gConnectNotify) gConnectNotify = nvrmfbCall(connectNotifyFire, nullptr);
     if (fHotplugBorn) FBLOG("fb%u: a display appeared after boot -- the connect interrupt will be fired once the head has a mode", fIndex);
     fPhysForVa = (nvrm_phys_for_va_t)(uintptr_t)propU64(provider, "phys-for-va");
     if (!fKms || !fPhysForVa || !fKms->getFlipPendingStatus || !fKms->dupMemory) { FBLOG("nub lacks nvkms-kapi/phys-for-va properties"); return false; }
@@ -2434,7 +2474,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         if (sl) IORecursiveLockUnlock(sl);
         if (mine) release();
     }
-    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall};
+    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fGpuWake, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fCursorCall, &fConnectNotify};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; ++i) {
         thread_call_t call = *calls[i];
         if (!call) continue;
@@ -2502,9 +2542,8 @@ IOReturn NVRMNVDAFramebuffer::enableController()
     // A display that appeared after boot: tell the framework, through the connect handler it registered (fConnect),
     // that this connection is new. It has to happen after the mode set -- WindowServer re-probes a framebuffer that
     // has a mode, and firing it earlier leaves the display undetected -- so it is a delayed call.
-    if (ok && fHotplugBorn && !fConnectFired && gConnectNotify) {
-        uint64_t d; clock_interval_to_deadline(1500, kMillisecondScale, &d);
-        thread_call_enter1_delayed(gConnectNotify, this, d);
+    if (ok && fHotplugBorn && !fConnectFired) {
+        notifyConnectionChanged(1500);
         FBLOG("fb%u: connect interrupt scheduled (1.5 s after the mode set)", fIndex);
     }
     return ok ? kIOReturnSuccess : kIOReturnError;
@@ -3595,14 +3634,14 @@ IOReturn NVRMNVDAFramebuffer::getAttributeForConnection(IOIndex connectIndex, IO
 {
     FBSEL(attribute);
     switch (attribute) {
-    case kConnectionEnable: if (value) *value = 1; FBLOG("getAFC '%s' -> enable 1", _s); return kIOReturnSuccess;
+    case kConnectionEnable: if (value) *value = fDpyLost ? 0 : 1; FBLOG("getAFC '%s' -> enable %u", _s, (unsigned)(fDpyLost ? 0 : 1)); return kIOReturnSuccess;
     case kConnectionFlags:  if (value) *value = fInternal ? kIOConnectionBuiltIn : 0; return kIOReturnSuccess;
     case kConnectionColorModesSupported:       if (value) *value = 0x00000001; return kIOReturnSuccess;
     case kConnectionColorDepthsSupported:      if (value) *value = 0x00000002; return kIOReturnSuccess;
     case kConnectionControllerColorDepth:      if (value) *value = 0x00000002; return kIOReturnSuccess;
     case kConnectionControllerDepthsSupported: if (value) *value = 0x00000002; return kIOReturnSuccess;
     case kConnectionColorMode:                 if (value) *value = 0x00000001; return kIOReturnSuccess;
-    case kConnectionCheckEnable:               if (value) *value = 1; return kIOReturnSuccess;
+    case kConnectionCheckEnable:               if (value) *value = fDpyLost ? 0 : 1; return kIOReturnSuccess;
     case kConnectionDisplayFlags:              if (value) *value = 0; return kIOReturnSuccess;
     case kConnectionSupportsHLDDCSense:
         FBLOG("fb%u getAFC HLDDCSense -> %s (EDID %u B)", fIndex, fEdidSize >= 128 ? "YES" : "no", (unsigned)fEdidSize);
@@ -3813,7 +3852,7 @@ IOReturn NVRMNVDAFramebuffer::setAttributeForConnection(IOIndex connectIndex, IO
 }
 IOReturn NVRMNVDAFramebuffer::getDDCBlock(IOIndex, UInt32 blockNumber, IOSelect blockType, IOOptionBits, UInt8 *data, IOByteCount *length)
 {
-    if (blockType != kIODDCBlockTypeEDID || blockNumber == 0 || blockNumber * 128 > fEdidSize) return kIOReturnUnsupported;
+    if (fDpyLost || blockType != kIODDCBlockTypeEDID || blockNumber == 0 || blockNumber * 128 > fEdidSize) return kIOReturnUnsupported;
     if (*length < 128) return kIOReturnBadArgument;
     nvu_copy(data, fEdid + (blockNumber - 1) * 128, 128); *length = 128;
     return kIOReturnSuccess;
